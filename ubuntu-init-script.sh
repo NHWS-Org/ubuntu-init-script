@@ -713,8 +713,69 @@ fi
 echo "[portainer-agent] ok ($MODE)"
 EOF
 
-sudo chown "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/"{upgrade.sh,docker-prune.sh,sysinfo.sh,tailscale-up.sh,docker-portainer-agent-update.sh,dockcheck.sh}
-chmod +x "$TARGET_HOME/"{upgrade.sh,docker-prune.sh,sysinfo.sh,tailscale-up.sh,docker-portainer-agent-update.sh,dockcheck.sh}
+# docker-portainer-main.update.sh
+cat > "$TARGET_HOME/docker-portainer-main.update.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Uso:
+#   ./docker-portainer-main.update.sh [AGENT_SECRET]
+# Persistenza config: $HOME/.config/portainer/main.env
+
+CONF_FILE="$HOME/.config/portainer/main.env"
+mkdir -p "$(dirname "$CONF_FILE")"
+
+SAVED_SECRET=""
+if [ -f "$CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+  SAVED_SECRET="${AGENT_SECRET:-}"
+fi
+
+SECRET="${1:-${AGENT_SECRET:-${SAVED_SECRET:-}}}"
+if [[ -z "$SECRET" ]]; then
+  read -r -p "AGENT_SECRET (lascia vuoto per non impostarlo): " SECRET || true
+fi
+
+cat >"$CONF_FILE" <<CFG
+AGENT_SECRET=$SECRET
+CFG
+chmod 600 "$CONF_FILE"
+
+IMAGE="${PORTAINER_IMAGE:-portainer/portainer-ce}"
+
+echo "[portainer-main] pull $IMAGE"
+sudo docker pull "$IMAGE"
+
+if sudo docker ps -a --format '{{.Names}}' | grep -Fxq portainer; then
+  echo "[portainer-main] stop+rm container esistente"
+  sudo docker stop portainer || true
+  sudo docker rm portainer || true
+fi
+
+RUN_ARGS=(
+  --name portainer
+  --restart=always
+  -d
+  -p 8000:8000
+  -p 9000:9000
+  -p 9443:9443
+  -v /var/run/docker.sock:/var/run/docker.sock
+  -v portainer_data:/data
+)
+
+if [[ -n "$SECRET" ]]; then
+  RUN_ARGS+=( -e "AGENT_SECRET=$SECRET" )
+fi
+
+echo "[portainer-main] run"
+sudo docker run "${RUN_ARGS[@]}" "$IMAGE"
+
+echo "[portainer-main] ok"
+EOF
+
+sudo chown "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/"{upgrade.sh,docker-prune.sh,sysinfo.sh,tailscale-up.sh,docker-portainer-agent-update.sh,docker-portainer-main.update.sh,dockcheck.sh}
+chmod +x "$TARGET_HOME/"{upgrade.sh,docker-prune.sh,sysinfo.sh,tailscale-up.sh,docker-portainer-agent-update.sh,docker-portainer-main.update.sh,dockcheck.sh}
 
 # ---- 6) Utilities: logrotate present ----
 if need_pkg logrotate; then
