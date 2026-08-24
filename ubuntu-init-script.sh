@@ -614,6 +614,13 @@ case "${MODE,,}" in
 esac
 
 IMAGE="${PORTAINER_AGENT_IMAGE:-portainer/agent:lts}"
+DOCKER_ROOT_DIR="$(sudo docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+if [[ -z "$DOCKER_ROOT_DIR" || "$DOCKER_ROOT_DIR" == "<no value>" ]]; then
+  echo "Errore: impossibile rilevare Docker Root Dir" >&2
+  exit 1
+fi
+VOLUMES_DIR="$DOCKER_ROOT_DIR/volumes"
+echo "[portainer-agent] directory volumi host: $VOLUMES_DIR"
 
 if [[ "$MODE" == "legacy" ]]; then
   SECRET="${1:-${AGENT_SECRET:-${SAVED_SECRET:-}}}"
@@ -650,7 +657,7 @@ CFG
   sudo docker run --name portainer_agent --restart=always -d \
     -p 9001:9001 \
     -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /var/lib/docker/volumes:/var/lib/docker/volumes \
+    -v "$VOLUMES_DIR:/var/lib/docker/volumes" \
     -e AGENT_SECRET="$SECRET" \
     "$IMAGE"
 else
@@ -699,7 +706,7 @@ CFG
   sudo docker run --name portainer_edge_agent --restart=always -d \
     -p 9001:9001 \
     -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /var/lib/docker/volumes:/var/lib/docker/volumes \
+    -v "$VOLUMES_DIR:/var/lib/docker/volumes" \
     -v /:/host \
     -v portainer_agent_data:/data \
     -e EDGE=1 \
