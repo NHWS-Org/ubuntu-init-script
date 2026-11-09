@@ -704,7 +704,6 @@ CFG
 
   echo "[portainer-agent] run edge"
   sudo docker run --name portainer_edge_agent --restart=always -d \
-    -p 9001:9001 \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$VOLUMES_DIR:/var/lib/docker/volumes" \
     -v /:/host \
