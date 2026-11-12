@@ -1,6 +1,8 @@
 # ubuntu-init-script
 Scripts useful to setup an ubuntu server
 
+On virtual machines, the script checks whether the root partition (or a single partition-backed LVM physical volume) is smaller than its virtual disk. If it detects a size difference, it asks whether to expand it; the default is no. For LVM, confirmation resizes the partition and physical volume, extends the root logical volume using all free space in its volume group, and grows the supported filesystem.
+
 # Deployment istruction
 ```
 bash <(curl -fsSL "https://raw.githubusercontent.com/napalmz/ubuntu-init-script/main/ubuntu-init-script.sh?$RANDOM")

@@ -81,6 +81,165 @@ need_pkg() { dpkg -s "$1" >/dev/null 2>&1 || return 0 && return 1; }
 file_has_line() { local f="$1"; local patt="$2"; [ -f "$f" ] && sudo grep -Fxq "$patt" "$f"; }
 ensure_apt_update() { sudo apt-get update -y; }
 
+# ---- VM root partition/LVM expansion (opt-in) ----
+expand_vm_root_partition() {
+  if ! command -v systemd-detect-virt >/dev/null 2>&1 || ! systemd-detect-virt --vm --quiet; then
+    return 0
+  fi
+
+  local root_source root_device root_fs root_type parent_disk part_number ans_partition=""
+  local partition_size disk_size resize_command resize_package growpart_check
+  local backing_device resize_device storage_type root_vg root_lv_path pv_devices
+  local -a pv_list=()
+  local -a required_packages=()
+  root_source="$(findmnt -nro SOURCE --target /)"
+  root_device="${root_source%%\[*}"
+  root_device="$(readlink -f "$root_device")"
+  root_fs="$(findmnt -nro FSTYPE --target /)"
+  root_type="$(lsblk -ndo TYPE "$root_device" 2>/dev/null || true)"
+
+  case "$root_type" in
+    part)
+      storage_type="partition"
+      backing_device="$root_device"
+      resize_device="$root_device"
+      ;;
+    lvm)
+      if ! command -v lvs >/dev/null 2>&1 || ! command -v pvs >/dev/null 2>&1; then
+        log "VM rilevata con root LVM, ma i comandi lvs/pvs non sono disponibili. Salto il controllo di espansione."
+        return 0
+      fi
+      if ! root_lv_path="$(sudo lvs --noheadings -o lv_path "$root_device" 2>/dev/null | awk 'NF {print $1; exit}')"; then
+        log "Impossibile identificare il volume logico root. Salto il controllo di espansione."
+        return 0
+      fi
+      if [ -z "$root_lv_path" ]; then
+        log "Impossibile identificare il volume logico root. Salto il controllo di espansione."
+        return 0
+      fi
+      if ! root_vg="$(sudo lvs --noheadings -o vg_name "$root_lv_path" 2>/dev/null | awk 'NF {print $1; exit}')"; then
+        log "Impossibile identificare il volume group del filesystem root. Salto il controllo di espansione."
+        return 0
+      fi
+      if ! pv_devices="$(sudo pvs --noheadings -o pv_name --select "vg_name=$root_vg" 2>/dev/null | awk 'NF {print $1}')"; then
+        log "Impossibile identificare i physical volume del root LVM. Salto il controllo di espansione."
+        return 0
+      fi
+      if [ -z "$pv_devices" ]; then
+        log "Nessun physical volume trovato per il root LVM. Salto il controllo di espansione."
+        return 0
+      fi
+      mapfile -t pv_list <<<"$pv_devices"
+      if ((${#pv_list[@]} != 1)); then
+        log "Il root LVM usa ${#pv_list[@]} physical volume; l'espansione automatica supporta un solo PV. Nessuna modifica eseguita."
+        return 0
+      fi
+      storage_type="lvm"
+      backing_device="$(readlink -f "${pv_list[0]}")"
+      resize_device="$root_lv_path"
+      ;;
+    *)
+      log "VM rilevata, ma il filesystem root non è direttamente su una partizione o su LVM ($root_source). Salto il controllo di espansione."
+      return 0
+      ;;
+  esac
+
+  if [ "$(lsblk -ndo TYPE "$backing_device" 2>/dev/null || true)" != "part" ]; then
+    log "Il dispositivo di backing root ($backing_device) non è una partizione espandibile. Salto il controllo di espansione."
+    return 0
+  fi
+
+  parent_disk="$(lsblk -ndo PKNAME "$backing_device")"
+  part_number="$(lsblk -ndo PARTN "$backing_device")"
+  if [ -z "$parent_disk" ] || [ -z "$part_number" ]; then
+    log "Impossibile determinare il disco o il numero della partizione di backing root. Salto il controllo di espansione."
+    return 0
+  fi
+
+  partition_size="$(lsblk -bndo SIZE "$backing_device")"
+  disk_size="$(lsblk -bndo SIZE "/dev/$parent_disk")"
+  if (( disk_size <= partition_size )); then
+    log "VM rilevata: nessuna discrepanza di dimensione tra disco e partizione di backing root."
+    return 0
+  fi
+
+  case "$root_fs" in
+    ext2|ext3|ext4)
+      resize_command="resize2fs"
+      resize_package="e2fsprogs"
+      ;;
+    xfs)
+      resize_command="xfs_growfs"
+      resize_package="xfsprogs"
+      ;;
+    btrfs)
+      resize_command="btrfs"
+      resize_package="btrfs-progs"
+      ;;
+    *)
+      log "Disco virtuale più grande della partizione di backing root, ma filesystem $root_fs non supportato per l'espansione automatica. Nessuna modifica eseguita."
+      return 0
+      ;;
+  esac
+  log "Discrepanza rilevata: disco /dev/$parent_disk ($(numfmt --to=iec --suffix=B "$disk_size")) più grande della partizione di backing root $backing_device ($(numfmt --to=iec --suffix=B "$partition_size"))."
+  if [ "$storage_type" = "lvm" ]; then
+    read -r -p "[?] Vuoi espandere la partizione, i volumi LVM e il filesystem root (y/N)? " ans_partition || true
+  else
+    read -r -p "[?] Vuoi espandere la partizione root e il filesystem (y/N)? " ans_partition || true
+  fi
+  if [[ "${ans_partition,,}" != "y" ]]; then
+    log "Espansione della partizione root saltata"
+    return 0
+  fi
+
+  if ! command -v growpart >/dev/null 2>&1; then
+    required_packages+=(cloud-guest-utils)
+  fi
+  if ! command -v "$resize_command" >/dev/null 2>&1; then
+    required_packages+=("$resize_package")
+  fi
+  if [ "$storage_type" = "lvm" ] && { ! command -v pvresize >/dev/null 2>&1 || ! command -v lvextend >/dev/null 2>&1; }; then
+    required_packages+=(lvm2)
+  fi
+  if ((${#required_packages[@]})); then
+    log "Installo gli strumenti necessari: ${required_packages[*]}"
+    sudo apt-get install -y "${required_packages[@]}"
+  fi
+  if ! command -v growpart >/dev/null 2>&1 || ! command -v "$resize_command" >/dev/null 2>&1 || \
+    { [ "$storage_type" = "lvm" ] && { ! command -v pvresize >/dev/null 2>&1 || ! command -v lvextend >/dev/null 2>&1; }; }; then
+    log "Strumenti di espansione non disponibili. Nessuna modifica eseguita."
+    return 0
+  fi
+
+  if ! growpart_check="$(sudo growpart --dry-run "/dev/$parent_disk" "$part_number" 2>&1)"; then
+    log "Impossibile verificare se la partizione può essere espansa: $growpart_check. Nessuna modifica eseguita."
+    return 0
+  fi
+  if ! grep -qE '^(CHANGE|CHANGED):' <<<"$growpart_check"; then
+    log "Nessuno spazio contiguo disponibile per espandere la partizione root. Nessuna modifica eseguita."
+    return 0
+  fi
+
+  log "Espando la partizione $part_number su /dev/$parent_disk"
+  sudo growpart "/dev/$parent_disk" "$part_number"
+
+  if [ "$storage_type" = "lvm" ]; then
+    log "Ridimensiono il physical volume su $backing_device"
+    sudo pvresize "$backing_device"
+    log "Espando il volume logico $root_lv_path con tutto lo spazio libero del volume group $root_vg"
+    sudo lvextend -l +100%FREE "$root_lv_path"
+  fi
+
+  log "Espando il filesystem $root_fs su $resize_device"
+  case "$root_fs" in
+    ext2|ext3|ext4) sudo resize2fs "$resize_device" ;;
+    xfs) sudo xfs_growfs / ;;
+    btrfs) sudo btrfs filesystem resize max / ;;
+  esac
+}
+
+expand_vm_root_partition
+
 # ---- duf helpers (GitHub releases) ----
 duf_arch_asset() {
   local a
